@@ -31,6 +31,7 @@ struct dump_options
     std::string  host;
     std::string  index;
     auth_options auth;
+    std::string  pit_id;
     int          slice_id;
     int          slice_max;
     int          size;
@@ -46,6 +47,12 @@ struct thread_container
     int          slice_id;
     thread_state state;
     std::thread  thread;
+};
+
+enum class http_method
+{
+    GET,
+    POST
 };
 
 size_t write_data(
@@ -69,7 +76,8 @@ bool get_or_post_data(
     std::vector<char>   * data,
     long                * response_code,
     std::string         * error,
-    std::string           body = "")
+    std::string           body = "",
+    http_method           method = http_method::GET)
 {
     curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -96,6 +104,11 @@ bool get_or_post_data(
     {
         curl_easy_setopt(crl, CURLOPT_POSTFIELDS, body.c_str());
     }
+    else if (method == http_method::POST)
+    {
+        curl_easy_setopt(crl, CURLOPT_POST, 1);
+        curl_easy_setopt(crl, CURLOPT_POSTFIELDSIZE, 0);
+    }
 
     CURLcode res = curl_easy_perform(crl);
     curl_slist_free_all(headers);
@@ -110,10 +123,21 @@ bool get_or_post_data(
     return false;
 }
 
+template <typename T>
+std::string json_to_string(
+    T const& doc)
+{
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+
+    return buffer.GetString();
+}
+
 void write_document(
     rapidjson::Document & document,
     int                 * hits_count,
-    std::string         * scroll_id)
+    rapidjson::Document & query)
 {
     std::unique_lock<std::mutex>      lock(mtx_out);
 
@@ -121,7 +145,6 @@ void write_document(
     static rapidjson::FileWriteStream stream(stdout, buffer, sizeof(buffer));
 
     // Epic const unfolding.
-    auto const& scroll_id_value   = document["_scroll_id"];
     auto const& hits_object_value = document["hits"];
     auto const& hits_object       = hits_object_value.GetObject();
     auto const& hits_value        = hits_object["hits"];
@@ -130,6 +153,12 @@ void write_document(
     // Shared allocator
     auto& allocator               = document.GetAllocator();
     auto  writer                  = rapidjson::Writer<rapidjson::FileWriteStream>(stream);
+
+    *hits_count = hits.Size();
+    if (hits.Size() == 0)
+    {
+        return;
+    }
 
     for (rapidjson::Value const& hit : hits)
     {
@@ -157,8 +186,10 @@ void write_document(
         writer.Reset(stream);
     }
 
-    *scroll_id  = scroll_id_value.GetString();
-    *hits_count = hits.Size();
+    auto const& last_hit = hits[hits.Size() - 1];
+    auto const& search_after = last_hit["sort"];
+
+    query["search_after"].CopyFrom(search_after, query.GetAllocator());
 }
 
 void output_parser_error(
@@ -177,13 +208,32 @@ void dump(
 {
     CURL* crl = curl_easy_init();
 
-    std::string query = "{\n"
-        "\"size\": " + std::to_string(options.size) + ",\n"
-        "\"slice\": {\n"
-            "\"id\": " + std::to_string(options.slice_id) + ",\n"
-            "\"max\": " + std::to_string(options.slice_max) + "\n"
-        "}\n"
-    "}";
+    auto query = rapidjson::Document(rapidjson::kObjectType);
+    auto& query_allocator = query.GetAllocator();
+
+    auto slice = rapidjson::Value(rapidjson::kObjectType);
+    slice.AddMember("id", rapidjson::Value(options.slice_id), query_allocator);
+    slice.AddMember("max", rapidjson::Value(options.slice_max), query_allocator);
+
+    auto pit = rapidjson::Value(rapidjson::kObjectType);
+    auto pit_id = rapidjson::Value();
+    pit_id.SetString(options.pit_id.c_str(), query_allocator);
+    pit.AddMember("id", pit_id, query_allocator);
+
+    // NOTE: Sort by _id is disabled in ES 8.x by default,
+    //       _score is available by default in all search results.
+    auto sort = rapidjson::Value(rapidjson::kArrayType);
+    auto sort_options = rapidjson::Value(rapidjson::kObjectType);
+    auto sort_element = rapidjson::Value(rapidjson::kObjectType);
+    sort_options.AddMember("order", rapidjson::Value("asc"), query_allocator);
+    sort_element.AddMember("_score", sort_options, query_allocator);
+    sort.PushBack(sort_element, query_allocator);
+
+    query.AddMember("size", rapidjson::Value(options.size), query_allocator);
+    query.AddMember("slice", slice, query_allocator);
+    query.AddMember("pit", pit, query_allocator);
+    query.AddMember("sort", sort, query_allocator);
+    query.AddMember("track_total_hits", rapidjson::Value(false), query_allocator);
 
     std::vector<char> buffer;
     long              response_code;
@@ -191,12 +241,12 @@ void dump(
 
     bool res = get_or_post_data(
         crl,
-        options.host + "/" + options.index + "/_search?scroll=1m",
+        options.host + "/_search",
         options.auth,
         &buffer,
         &response_code,
         &error,
-        query);
+        json_to_string(query));
 
     if (!res)
     {
@@ -218,31 +268,27 @@ void dump(
         return output_parser_error(doc, state->error);
     }
 
-    std::string scroll_id;
-    int         hits_count;
+    int hits_count;
+    auto search_after = rapidjson::Value(rapidjson::kArrayType);
+    query.AddMember("search_after", search_after, query_allocator);
 
     write_document(
         doc,
         &hits_count,
-        &scroll_id);
-
-    do
+        query);
+    
+    while (hits_count > 0)
     {
-        query = "{\n"
-            "\"scroll\": \"1m\",\n"
-            "\"scroll_id\": \"" + scroll_id + "\"\n"
-        "}\n";
-
         buffer.clear();
 
         res = get_or_post_data(
             crl,
-            options.host + "/_search/scroll",
+            options.host + "/_search",
             options.auth,
             &buffer,
             &response_code,
             &error,
-            query);
+            json_to_string(query));
 
         if (!res)
         {
@@ -267,8 +313,8 @@ void dump(
         write_document(
             doc_search,
             &hits_count,
-            &scroll_id);
-    } while (hits_count > 0);
+            query);
+    }
 
     curl_easy_cleanup(crl);
 }
@@ -308,6 +354,45 @@ int64_t count_documents(
     }
 
     return doc["count"].GetInt64();
+}
+
+std::string create_pit_id(
+    std::string  const& host,
+    std::string  const& index,
+    auth_options const& auth)
+{
+    CURL                * crl = curl_easy_init();
+    long                  response_code;
+    rapidjson::Document   doc;
+    std::string           url = host + "/" + index + "/_pit?keep_alive=1m&allow_partial_search_results=false";
+    std::string           error;
+    std::vector<char>     buffer;
+
+    bool res = get_or_post_data(
+        crl,
+        url,
+        auth,
+        &buffer,
+        &response_code,
+        &error,
+        "",
+        http_method::POST);
+
+    if (!res)
+    {
+        std::cerr << "A HTTP error occured: " << error << std::endl;
+        return "";
+    }
+
+    doc.Parse(buffer.data(), buffer.size());
+
+    if (doc.HasParseError())
+    {
+        output_parser_error(doc, std::cerr);
+        return "";
+    }
+
+    return doc["id"].GetString();
 }
 
 int dump_mappings(
@@ -473,6 +558,13 @@ int main(
         return 0;
     }
 
+    const auto pit_id = create_pit_id(host, index, auth);
+    if (pit_id.empty())
+    {
+        std::cerr << "Failed to create PIT" << std::endl;
+        return 1;
+    }
+
     int slices;
     cmdl({"--slices"}, DEFAULT_SLICES) >> slices;
 
@@ -486,6 +578,7 @@ int main(
         opts.index     = index;
         opts.auth      = auth;
         opts.size      = size;
+        opts.pit_id    = pit_id;
         opts.slice_id  = i;
         opts.slice_max = slices;
 
